@@ -1,0 +1,8 @@
+- insert:
+    - id: dsh-turn-notify
+      name: '@99galaxy/dsh-turn-notify'
+      config:
+        enabled: true
+        notifyWhenFocused: true
+        skipSubagents: true
+        message: 本轮已完成
