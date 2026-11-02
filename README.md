@@ -45,6 +45,7 @@ dsh为啥还没有后台消息通知啊……后台跑任务的时候根本不�
        enabled: true
        notifyWhenFocused: true
        skipSubagents: true
+       maskTitle: false
        message: 本轮已完成
    ```
 
@@ -55,6 +56,7 @@ dsh为啥还没有后台消息通知啊……后台跑任务的时候根本不�
 | `enabled` | `true` | 是否启用通知 |
 | `notifyWhenFocused` | `true` | 设为 `false` 时，窗口在前台且正在查看该会话则不提醒 |
 | `skipSubagents` | `true` | 是否跳过子代理会话 |
+| `maskTitle` | `false` | 设为 `true` 时，系统通知标题固定为“会话已完成”，避免显示会话名称 |
 | `message` | `本轮已完成` | 通知正文前缀 |
 
 配置需要 profile 提供 `webServer` 服务。修改配置后重启 DSH，使客户端重新读取。
@@ -68,6 +70,9 @@ dsh为啥还没有后台消息通知啊……后台跑任务的时候根本不�
 │   └── client.js      # 会话状态检测和系统通知
 ├── test/
 │   └── smoke.mjs      # 回归测试
+├── .github/
+│   └── workflows/
+│       └── test.yml   # GitHub Actions 测试
 ├── .gitignore         # 本地配置、凭据及构建产物忽略规则
 ├── LICENSE            # MIT 许可证
 ├── cordis.patch.yml   # DSH bundle 安装入口

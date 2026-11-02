@@ -5,4 +5,5 @@
         enabled: true
         notifyWhenFocused: true
         skipSubagents: true
+        maskTitle: false
         message: 本轮已完成

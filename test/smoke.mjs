@@ -29,9 +29,13 @@ function assert(condition, label) {
 /** Build one isolated runtime: bundle, fake page, fake uiSession. */
 function createRuntime(options = {}) {
 	const shown = [];
+	const notificationInstances = [];
 	const warnings = [];
+	const infos = [];
+	const debugMessages = [];
 	/** Every interval the bundle registered, so a test can drive the poll. */
 	const intervals = new Set();
+	const microtasks = [];
 
 	class FakeNotification {
 		static permission = options.permission ?? "granted";
@@ -43,6 +47,7 @@ function createRuntime(options = {}) {
 			this.title = title;
 			this.opts = opts ?? {};
 			shown.push({ title, ...this.opts });
+			notificationInstances.push(this);
 		}
 	}
 
@@ -82,11 +87,14 @@ function createRuntime(options = {}) {
 		},
 		console: {
 			log: () => {},
+			info: (...args) => infos.push(args.map(String).join(" ")),
+			debug: (...args) => debugMessages.push(args.map(String).join(" ")),
 			warn: (...args) => warnings.push(args.map(String).join(" ")),
 			error: (...args) => warnings.push(args.map(String).join(" ")),
 		},
 	};
 	if (options.fetch) globals.fetch = options.fetch;
+	if (options.queueMicrotasks) globals.queueMicrotask = (callback) => microtasks.push(callback);
 	if (options.now) {
 		globals.Date = class extends Date {
 			static now() {
@@ -140,7 +148,10 @@ function createRuntime(options = {}) {
 		moduleExports,
 		ctx,
 		shown,
+		notificationInstances,
 		warnings,
+		infos,
+		debugMessages,
 		document,
 		/** Turn-completion toasts only, without the diagnostic stream. */
 		real: () => shown.filter((toast) => toast.tag !== "dsh-turn-notify-dump"),
@@ -163,6 +174,10 @@ function createRuntime(options = {}) {
 			for (const handle of intervals) handle.callback();
 		},
 		intervalCount: () => intervals.size,
+		microtaskCount: () => microtasks.length,
+		flushMicrotasks() {
+			while (microtasks.length > 0) microtasks.shift()();
+		},
 		dispose() {
 			if (typeof teardown === "function") teardown();
 			teardown = undefined;
@@ -184,6 +199,20 @@ console.log("bundle registration");
 	assert(runtime.moduleExports.buildMarker === undefined, "no stray runtime fields");
 }
 
+console.log("missing module loader");
+{
+	const warnings = [];
+	runInContext(
+		source,
+		createContext({
+			console: {
+				warn: (...args) => warnings.push(args.map(String).join(" ")),
+			},
+		}),
+	);
+	assert(warnings.some((line) => line.includes("module loader unavailable")), "missing loader degrades safely");
+}
+
 console.log("config normalization");
 {
 	const runtime = createRuntime();
@@ -194,6 +223,7 @@ console.log("config normalization");
 	assert(typed.enabled === true, "wrong-typed flag falls back to the default");
 	assert(normalizeConfig({ notifyWhenFocused: false }).notifyWhenFocused === false, "the quiet rule can be opted into");
 	assert(typed.message === "好了", "custom message is accepted");
+	assert(normalizeConfig({ maskTitle: true }).maskTitle === true, "title masking can be opted into");
 }
 
 console.log("background session finished");
@@ -234,6 +264,94 @@ console.log("duration reaches the toast");
 		runtime.real()[0].body === "本轮已完成 · 2m 13s",
 		"the elapsed time is captured before turn state is cleared",
 	);
+	runtime.dispose();
+}
+
+console.log("short duration and empty message");
+{
+	let now = 1000;
+	const runtime = createRuntime({
+		focused: false,
+		now: () => now,
+		rows: { "session-a": { title: "短任务" } },
+	});
+	runtime.moduleExports.apply(runtime.ctx, { message: "  " });
+	runtime.setStatus({ "session-a": { running: true } });
+	now += 250;
+	runtime.setStatus({ "session-a": { running: false } });
+	assert(runtime.real()[0].body === "< 1s", "sub-second turns use a readable duration");
+	runtime.setStatus({ "session-a": { running: true } });
+	now += 12000;
+	runtime.setStatus({ "session-a": { running: false } });
+	assert(runtime.real()[1].body === "12s", "an empty message does not leave a separator prefix");
+	runtime.dispose();
+}
+
+console.log("privacy title mask");
+{
+	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: "客户机密计划" } } });
+	runtime.moduleExports.apply(runtime.ctx, { maskTitle: true });
+	runtime.setStatus({ "session-a": { running: true } });
+	runtime.setStatus({ "session-a": { running: false } });
+	assert(runtime.real()[0].title === "会话已完成", "maskTitle removes the session title");
+	runtime.dispose();
+}
+
+console.log("notification lifecycle");
+{
+	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: "生命周期" } } });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({ "session-a": { running: true } });
+	runtime.setStatus({ "session-a": { running: false } });
+	const notification = runtime.notificationInstances[0];
+	notification.onclose();
+	assert(
+		notification.onclick === null &&
+			notification.onshow === null &&
+			notification.onerror === null &&
+			notification.onclose === null,
+		"notification close releases event handler closures",
+	);
+	runtime.dispose();
+}
+
+console.log("notification tags");
+{
+	const prefix = "session_20261102_";
+	const runtime = createRuntime({
+		focused: false,
+		rows: {
+			[prefix + "001"]: { title: "第一个" },
+			[prefix + "002"]: { title: "第二个" },
+		},
+	});
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({
+		[prefix + "001"]: { running: true },
+		[prefix + "002"]: { running: true },
+	});
+	runtime.setStatus({
+		[prefix + "001"]: { running: false },
+		[prefix + "002"]: { running: false },
+	});
+	assert(runtime.real().length === 2, "simultaneously completed sessions both notify");
+	assert(runtime.real()[0].tag !== runtime.real()[1].tag, "full session ids prevent tag collisions");
+	runtime.dispose();
+}
+
+console.log("status event batching");
+{
+	const runtime = createRuntime({
+		focused: false,
+		queueMicrotasks: true,
+		rows: { "session-a": { title: "批量事件" } },
+	});
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({ "session-a": { running: true } });
+	runtime.setStatus({ "session-a": { running: false, completionUnread: true } });
+	assert(runtime.microtaskCount() === 1, "a burst of status events schedules one tick");
+	runtime.flushMicrotasks();
+	assert(runtime.real().length === 1, "the batched tick preserves completion fallback");
 	runtime.dispose();
 }
 
@@ -311,6 +429,20 @@ console.log("remote client config");
 	runtime.dispose();
 }
 
+console.log("remote config failure");
+{
+	const runtime = createRuntime({
+		fetch: async () => {
+			throw new Error("offline");
+		},
+	});
+	runtime.moduleExports.apply(runtime.ctx, {});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert(runtime.listenerCount() === 1, "a failed remote config still starts the watcher");
+	assert(runtime.infos.some((line) => line.includes("remote config unavailable")), "fetch failure falls back safely");
+	runtime.dispose();
+}
+
 console.log("host config route");
 {
 	let route;
@@ -340,6 +472,7 @@ console.log("host config route");
 			message: "来自宿主",
 			notifyWhenFocused: false,
 			skipSubagents: false,
+			maskTitle: true,
 		},
 	);
 	let status = 0;
@@ -358,8 +491,25 @@ console.log("host config route");
 	assert(status === 200 && payload.ok === true, "the config route returns JSON");
 	assert(payload.config.message === "来自宿主", "the host returns configured client values");
 	assert(payload.config.notifyWhenFocused === false, "boolean options preserve their declared type");
+	assert(payload.config.maskTitle === true, "the host forwards title masking");
 	route.handler({ method: "POST" }, response);
 	assert(status === 405, "the config route is read-only");
+	let threw = false;
+	try {
+		route.handler(
+			{ method: "GET" },
+			{
+				headersSent: false,
+				writeHead() {},
+				end() {
+					throw new Error("closed");
+				},
+			},
+		);
+	} catch (_error) {
+		threw = true;
+	}
+	assert(threw === false, "closed response streams do not escape the host handler");
 	cleanup();
 	assert(disposed === true, "the route is disposed with the plugin effect");
 }
@@ -440,6 +590,16 @@ console.log("subagents stay quiet");
 	runtime.dispose();
 }
 
+console.log("hidden subagent status");
+{
+	const runtime = createRuntime({ focused: false, rows: {} });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({ "hidden-child": { running: true, subagent: { mode: "continuable" } } });
+	runtime.setStatus({ "hidden-child": { running: false, subagent: { mode: "continuable" } } });
+	assert(runtime.real().length === 0, "status-only subagent metadata still suppresses the toast");
+	runtime.dispose();
+}
+
 console.log("seeding and teardown");
 {
 	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: "旧会话" } } });
@@ -459,7 +619,7 @@ console.log("debug probe");
 	runtime.moduleExports.apply(runtime.ctx, { debugProbe: true });
 	assert(runtime.real().length === 1, "debugProbe raises exactly one startup toast");
 	assert(runtime.real()[0].tag === "dsh-turn-notify-probe", "the probe uses its own tag");
-	assert(runtime.warnings.some((line) => line.includes("turn-notify: active")), "the probe logs its state");
+	assert(runtime.infos.some((line) => line.includes("turn-notify: active")), "the probe logs its state");
 	runtime.dispose();
 }
 
@@ -491,6 +651,11 @@ console.log("debug dump");
 		runtime.real().some((toast) => String(toast.tag).startsWith("dshturn-")),
 		"debugDump bypasses the quiet rule",
 	);
+	assert(
+		runtime.shown.filter((toast) => toast.tag === "dsh-turn-notify-dump").length === 1,
+		"debugDump emits only one diagnostic OS toast",
+	);
+	assert(runtime.debugMessages.some((line) => line.includes("turn-notify dump")), "later diagnostics use the console");
 	runtime.dispose();
 }
 
@@ -565,6 +730,15 @@ console.log("missing Notification API is reported, not thrown");
 		runtime.warnings.some((line) => line.includes("no Notification API")),
 		"the reason is logged once",
 	);
+}
+
+console.log("denied Notification permission");
+{
+	const runtime = createRuntime({ permission: "denied" });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	assert(runtime.listenerCount() === 0, "denied permission does not create listeners");
+	assert(runtime.intervalCount() === 0, "denied permission does not start polling");
+	assert(runtime.infos.some((line) => line.includes("permission denied")), "denied permission is logged once");
 }
 
 console.log("late uiSession provider");
