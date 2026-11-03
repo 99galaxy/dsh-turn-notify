@@ -35,13 +35,16 @@ function createRuntime(options = {}) {
 	const debugMessages = [];
 	/** Every interval the bundle registered, so a test can drive the poll. */
 	const intervals = new Set();
-	const microtasks = [];
+	const timers = new Set();
 
 	class FakeNotification {
 		static permission = options.permission ?? "granted";
 		static requestPermission() {
-			FakeNotification.permission = "granted";
-			return Promise.resolve("granted");
+			const permission = options.requestedPermission ?? "granted";
+			return Promise.resolve(permission).then((resolved) => {
+				FakeNotification.permission = resolved;
+				return resolved;
+			});
 		}
 		constructor(title, opts) {
 			this.title = title;
@@ -85,6 +88,14 @@ function createRuntime(options = {}) {
 		clearInterval: (handle) => {
 			intervals.delete(handle);
 		},
+		setTimeout: (callback, ms) => {
+			const handle = { callback, ms };
+			timers.add(handle);
+			return handle;
+		},
+		clearTimeout: (handle) => {
+			timers.delete(handle);
+		},
 		console: {
 			log: () => {},
 			info: (...args) => infos.push(args.map(String).join(" ")),
@@ -94,7 +105,6 @@ function createRuntime(options = {}) {
 		},
 	};
 	if (options.fetch) globals.fetch = options.fetch;
-	if (options.queueMicrotasks) globals.queueMicrotask = (callback) => microtasks.push(callback);
 	if (options.now) {
 		globals.Date = class extends Date {
 			static now() {
@@ -112,6 +122,7 @@ function createRuntime(options = {}) {
 	const listeners = new Set();
 	let rows = options.rows ?? {};
 	const listListeners = new Set();
+	const remoteListeners = new Set();
 	const byId = () =>
 		Object.fromEntries(
 			Object.entries(rows).map(([id, row]) => [id, { retainedBy: { mainView: 0 }, ...row }]),
@@ -143,6 +154,14 @@ function createRuntime(options = {}) {
 			return teardown;
 		},
 	};
+	if (options.remote) {
+		ctx.remote = {
+			$on(event, listener) {
+				if (event === "api-session/status") remoteListeners.add(listener);
+				return () => remoteListeners.delete(listener);
+			},
+		};
+	}
 
 	const api = {
 		moduleExports,
@@ -153,31 +172,40 @@ function createRuntime(options = {}) {
 		infos,
 		debugMessages,
 		document,
+		/** Run pending debounce timers in insertion order. */
+		flushTimers() {
+			const pending = [...timers];
+			timers.clear();
+			for (const handle of pending) handle.callback();
+		},
+		timerCount: () => timers.size,
 		/** Turn-completion toasts only, without the diagnostic stream. */
 		real: () => shown.filter((toast) => toast.tag !== "dsh-turn-notify-dump"),
 		/** Publish a new status map and notify subscribers like the host store. */
 		setStatus(next) {
 			status = new Map(Object.entries(next));
 			for (const listener of listeners) listener();
+			if (!options.manualBatching) this.flushTimers();
 		},
 		/** Replace the Session list rows and notify list subscribers. */
 		setRows(next) {
 			rows = next;
 			for (const listener of listListeners) listener();
+			if (!options.manualBatching) this.flushTimers();
 		},
 		/** Replace the Session list rows without telling any subscriber. */
 		setRowsSilently(next) {
 			rows = next;
 		},
+		emitRunning(sessionId, running) {
+			for (const listener of remoteListeners) listener(sessionId, running);
+		},
 		/** Run every registered poll callback once. */
 		firePoll() {
 			for (const handle of intervals) handle.callback();
+			this.flushTimers();
 		},
 		intervalCount: () => intervals.size,
-		microtaskCount: () => microtasks.length,
-		flushMicrotasks() {
-			while (microtasks.length > 0) microtasks.shift()();
-		},
 		dispose() {
 			if (typeof teardown === "function") teardown();
 			teardown = undefined;
@@ -241,10 +269,78 @@ console.log("background session finished");
 	assert(runtime.real().length === 1, "finishing a turn raises exactly one toast");
 	assert(runtime.real()[0].title === "重构登录模块", "toast title is the session title");
 	assert(String(runtime.real()[0].body).startsWith("本轮已完成"), "toast body uses the configured message");
+	assert(String(runtime.real()[0].body).includes("对话：重构登录模块"), "toast body names the completed conversation");
 	assert(String(runtime.real()[0].tag).startsWith("dshturn-"), "toast tag is per session");
 	// a further publish with no change must not repeat
 	runtime.setStatus({ "session-a": { running: false, pendingInteraction: { kind: "question" } } });
 	assert(runtime.real().length === 1, "unrelated status churn does not repeat the toast");
+	runtime.dispose();
+}
+
+console.log("asynchronous session baseline");
+{
+	const runtime = createRuntime({ focused: false, rows: {} });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setRowsSilently({ "historical": { title: "历史会话", running: false } });
+	runtime.setStatus({ historical: { running: false, completionUnread: true } });
+	assert(runtime.real().length === 0, "an asynchronously loaded historical unread session stays quiet");
+	runtime.setStatus({ historical: { running: true, completionUnread: false } });
+	runtime.setStatus({ historical: { running: false, completionUnread: true } });
+	assert(runtime.real().length === 1, "a later turn from that session still notifies");
+	runtime.dispose();
+}
+
+console.log("split source baseline");
+{
+	let now = 1000;
+	const runtime = createRuntime({ focused: false, now: () => now, rows: {} });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setRows({ historical: { title: "分批历史", running: false } });
+	runtime.setStatus({ historical: { running: false, completionUnread: true } });
+	assert(runtime.real().length === 0, "list-then-status historical unread sessions stay quiet");
+	now += 3000;
+	runtime.setStatus({ historical: { running: true, completionUnread: false } });
+	runtime.setStatus({ historical: { running: false, completionUnread: true } });
+	assert(runtime.real().length === 1, "a later observed turn still notifies after the baseline settles");
+	runtime.dispose();
+}
+
+console.log("session state retention");
+{
+	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: "常驻会话" } } });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({ "session-a": { running: true, completionUnread: false } });
+	runtime.setStatus({ "session-a": { running: false, completionUnread: true } });
+	runtime.setRowsSilently({});
+	runtime.setStatus({});
+	runtime.setRowsSilently({ "session-a": { title: "常驻会话", running: false } });
+	runtime.setStatus({ "session-a": { running: false, completionUnread: true } });
+	assert(runtime.real().length === 1, "a hidden sticky completion does not retoast when it reappears");
+	runtime.dispose();
+}
+
+console.log("large sticky session set");
+{
+	const runtime = createRuntime({ focused: false, rows: {} });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setRowsSilently({ first: { title: "最早会话", running: false } });
+	runtime.setStatus({ first: { running: false, completionUnread: true } });
+	assert(runtime.real().length === 0, "the first historical session is suppressed");
+	const rows = {};
+	const statuses = {};
+	for (let index = 0; index < 205; index += 1) {
+		const id = "history-" + index;
+		rows[id] = { title: id, running: false };
+		statuses[id] = { running: false, completionUnread: true };
+	}
+	runtime.setRowsSilently({ first: { title: "最早会话", running: false }, ...rows });
+	runtime.setStatus(statuses);
+	assert(runtime.real().length === 0, "bulk historical unread sessions are seeded quietly");
+	runtime.setStatus({
+		...statuses,
+		first: { running: false, completionUnread: true },
+	});
+	assert(runtime.real().length === 0, "retaining more than 200 sessions does not retoast the oldest");
 	runtime.dispose();
 }
 
@@ -261,8 +357,8 @@ console.log("duration reaches the toast");
 	now += 133000;
 	runtime.setStatus({ "session-a": { running: false } });
 	assert(
-		runtime.real()[0].body === "本轮已完成 · 2m 13s",
-		"the elapsed time is captured before turn state is cleared",
+		runtime.real()[0].body === "本轮已完成 · 2m 13s\n对话：耗时会话",
+		"the body includes elapsed time and conversation title",
 	);
 	runtime.dispose();
 }
@@ -279,11 +375,11 @@ console.log("short duration and empty message");
 	runtime.setStatus({ "session-a": { running: true } });
 	now += 250;
 	runtime.setStatus({ "session-a": { running: false } });
-	assert(runtime.real()[0].body === "< 1s", "sub-second turns use a readable duration");
+	assert(runtime.real()[0].body === "< 1s\n对话：短任务", "sub-second turns use a readable duration");
 	runtime.setStatus({ "session-a": { running: true } });
 	now += 12000;
 	runtime.setStatus({ "session-a": { running: false } });
-	assert(runtime.real()[1].body === "12s", "an empty message does not leave a separator prefix");
+	assert(runtime.real()[1].body === "12s\n对话：短任务", "an empty message does not leave a separator prefix");
 	runtime.dispose();
 }
 
@@ -294,6 +390,25 @@ console.log("privacy title mask");
 	runtime.setStatus({ "session-a": { running: true } });
 	runtime.setStatus({ "session-a": { running: false } });
 	assert(runtime.real()[0].title === "会话已完成", "maskTitle removes the session title");
+	assert(
+		runtime.real()[0].body.includes("对话：会话已完成") && !runtime.real()[0].body.includes("客户机密计划"),
+		"maskTitle also removes the session title from the body",
+	);
+	runtime.dispose();
+}
+
+console.log("title sanitization");
+{
+	const longTitle =
+		"https://user:pass@example.com/api  token=abc123 这是一个超过六十个字符的会话标题，用于验证系统通知不会无限截取用户输入的敏感长文本内容";
+	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: longTitle } } });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({ "session-a": { running: true } });
+	runtime.setStatus({ "session-a": { running: false } });
+	const title = runtime.real()[0].title;
+	assert(!title.includes("pass"), "URL credentials are removed from notification titles");
+	assert(!title.includes("pass"), "token-like assignments are redacted");
+	assert(title.length <= 60, "notification titles are bounded");
 	runtime.dispose();
 }
 
@@ -341,17 +456,39 @@ console.log("notification tags");
 
 console.log("status event batching");
 {
+	let now = 1000;
 	const runtime = createRuntime({
 		focused: false,
-		queueMicrotasks: true,
+		manualBatching: true,
+		now: () => now,
 		rows: { "session-a": { title: "批量事件" } },
 	});
 	runtime.moduleExports.apply(runtime.ctx, {});
+	now += 3000;
 	runtime.setStatus({ "session-a": { running: true } });
 	runtime.setStatus({ "session-a": { running: false, completionUnread: true } });
-	assert(runtime.microtaskCount() === 1, "a burst of status events schedules one tick");
-	runtime.flushMicrotasks();
+	assert(runtime.timerCount() === 1, "a burst of status events schedules one tick");
+	runtime.flushTimers();
 	assert(runtime.real().length === 1, "the batched tick preserves completion fallback");
+	runtime.dispose();
+}
+
+console.log("consecutive short turns");
+{
+	const runtime = createRuntime({
+		focused: false,
+		manualBatching: true,
+		remote: true,
+		rows: { "session-a": { title: "连续短回合" } },
+	});
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.emitRunning("session-a", true);
+	runtime.emitRunning("session-a", false);
+	runtime.emitRunning("session-a", true);
+	runtime.emitRunning("session-a", false);
+	assert(runtime.timerCount() === 1, "two short turns share one batched snapshot");
+	runtime.flushTimers();
+	assert(runtime.real().length === 2, "event edges preserve both consecutive completions");
 	runtime.dispose();
 }
 
@@ -371,14 +508,23 @@ console.log("unknown running state");
 	now += 128000;
 	runtime.setStatus({ "session-a": { running: false } });
 	assert(runtime.real().length === 1, "an explicit false still reports completion");
-	assert(runtime.real()[0].body.endsWith("2m 13s"), "an unknown state preserves the turn start time");
+	assert(
+		runtime.real()[0].body.split("\n")[0].endsWith("2m 13s"),
+		"an unknown state preserves the turn start time",
+	);
 	runtime.dispose();
 }
 
 console.log("short turn completion fallback");
 {
-	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: "极短回合" } } });
+	let now = 1000;
+	const runtime = createRuntime({
+		focused: false,
+		now: () => now,
+		rows: { "session-a": { title: "极短回合" } },
+	});
 	runtime.moduleExports.apply(runtime.ctx, {});
+	now += 3000;
 	runtime.setStatus({ "session-a": { running: false, completionUnread: true } });
 	assert(runtime.real().length === 1, "completionUnread catches a turn unseen by the poll");
 	runtime.setStatus({ "session-a": { running: false, completionUnread: true } });
@@ -421,11 +567,55 @@ console.log("remote client config");
 		rows: { "session-a": { title: "远端配置" } },
 	});
 	runtime.moduleExports.apply(runtime.ctx, {});
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await new Promise((resolve) => setImmediate(resolve));
 	assert(requested === "/dsh-turn-notify/config", "the browser reads the host config route");
 	runtime.setStatus({ "session-a": { running: true } });
 	runtime.setStatus({ "session-a": { running: false } });
-	assert(runtime.real()[0].body === "宿主配置", "host config reaches the browser plugin");
+	assert(
+		runtime.real()[0].body === "宿主配置\n对话：远端配置",
+		"host config reaches the browser plugin",
+	);
+	runtime.dispose();
+}
+
+console.log("config loading does not block startup");
+{
+	let resolveConfig;
+	const runtime = createRuntime({
+		focused: false,
+		fetch: () =>
+			new Promise((resolve) => {
+				resolveConfig = resolve;
+			}),
+		rows: { "session-a": { title: "启动期间" } },
+	});
+	runtime.moduleExports.apply(runtime.ctx, {});
+	assert(runtime.listenerCount() === 1, "the watcher starts before the config request resolves");
+	runtime.setStatus({ "session-a": { running: true } });
+	runtime.setStatus({ "session-a": { running: false } });
+	assert(runtime.real().length === 0, "a turn during config loading waits for final settings");
+	resolveConfig({
+		ok: true,
+		json: async () => ({
+			ok: true,
+			config: {
+				enabled: true,
+				notifyWhenFocused: true,
+				skipSubagents: true,
+				maskTitle: false,
+				message: "热更新",
+				debugProbe: false,
+				debugDump: false,
+			},
+		}),
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert(runtime.real().length === 1, "a turn during config loading is not lost");
+	const queuedBody = runtime.real()[0].body;
+	assert(
+		queuedBody === "热更新\n对话：启动期间",
+		"the queued turn uses the loaded config (body=" + queuedBody + ")",
+	);
 	runtime.dispose();
 }
 
@@ -477,6 +667,7 @@ console.log("host config route");
 	);
 	let status = 0;
 	let body = "";
+	let requestErrorHandled = false;
 	const response = {
 		writeHead(code) {
 			status = code;
@@ -485,15 +676,34 @@ console.log("host config route");
 			body = String(value);
 		},
 	};
-	route.handler({ method: "GET" }, response);
+	route.handler(
+		{
+			method: "GET",
+			on(event) {
+				if (event === "error") requestErrorHandled = true;
+			},
+		},
+		response,
+	);
 	const payload = JSON.parse(body);
 	assert(route.path === "/dsh-turn-notify/config", "the config route uses the package namespace");
 	assert(status === 200 && payload.ok === true, "the config route returns JSON");
+	assert(requestErrorHandled === true, "the host observes request stream errors");
 	assert(payload.config.message === "来自宿主", "the host returns configured client values");
 	assert(payload.config.notifyWhenFocused === false, "boolean options preserve their declared type");
 	assert(payload.config.maskTitle === true, "the host forwards title masking");
+	const clientDefaults = createRuntime().moduleExports.normalizeConfig(undefined);
+	assert(
+		JSON.stringify(Object.keys(payload.config).sort()) ===
+			JSON.stringify(Object.keys(clientDefaults).sort()),
+		"host and client configuration keys stay aligned",
+	);
 	route.handler({ method: "POST" }, response);
 	assert(status === 405, "the config route is read-only");
+	route.handler({ method: "HEAD" }, response);
+	assert(status === 200 && body === "", "the config route supports bodyless HEAD requests");
+	route.handler({ method: "OPTIONS" }, response);
+	assert(status === 204, "the config route handles same-origin preflight requests");
 	let threw = false;
 	try {
 		route.handler(
@@ -698,7 +908,7 @@ console.log("subscription does not depend on ctx.effect");
 			return () => {};
 		},
 	};
-	runtime.moduleExports.apply(inertCtx, {});
+	const dispose = runtime.moduleExports.apply(inertCtx, {});
 	assert(runtime.listenerCount() === 1, "subscribes even when ctx.effect never runs the factory");
 	runtime.setStatus({ "session-a": { running: true } });
 	runtime.setStatus({ "session-a": { running: false } });
@@ -706,6 +916,9 @@ console.log("subscription does not depend on ctx.effect");
 		runtime.real().length === 1 && runtime.real()[0].title === "不靠 effect",
 		"the watcher still works on such a kernel",
 	);
+	dispose();
+	assert(runtime.listenerCount() === 0, "the returned disposer unsubscribes when effect is inert");
+	assert(runtime.intervalCount() === 0, "the returned disposer clears polling when effect is inert");
 }
 
 console.log("disabled plugin does nothing");
@@ -741,6 +954,33 @@ console.log("denied Notification permission");
 	assert(runtime.infos.some((line) => line.includes("permission denied")), "denied permission is logged once");
 }
 
+console.log("asynchronous permission denial");
+{
+	const runtime = createRuntime({ permission: "default", requestedPermission: "denied" });
+	runtime.moduleExports.apply(runtime.ctx, {});
+	assert(runtime.listenerCount() === 1, "a pending permission request allows startup while it resolves");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert(runtime.listenerCount() === 0, "an asynchronous denial removes listeners");
+	assert(runtime.intervalCount() === 0, "an asynchronous denial stops polling");
+}
+
+console.log("asynchronous permission grant");
+{
+	const runtime = createRuntime({
+		permission: "default",
+		requestedPermission: "granted",
+		focused: false,
+		rows: { "session-a": { title: "等待授权" } },
+	});
+	runtime.moduleExports.apply(runtime.ctx, {});
+	runtime.setStatus({ "session-a": { running: true } });
+	runtime.setStatus({ "session-a": { running: false } });
+	assert(runtime.real().length === 0, "a completion waits while permission is pending");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert(runtime.real().length === 1, "the pending completion is delivered after permission is granted");
+	runtime.dispose();
+}
+
 console.log("late uiSession provider");
 {
 	const runtime = createRuntime({ focused: false, rows: { "session-a": { title: "晚到会话" } } });
@@ -753,6 +993,7 @@ console.log("late uiSession provider");
 	runtime.moduleExports.apply(lateCtx, {});
 	assert(pending !== undefined && pending.deps.includes("uiSession"), "waits through ctx.inject");
 	assert(runtime.listenerCount() === 0, "nothing is subscribed before the service arrives");
+	pending.callback({ uiSession: runtime.ctx.uiSession, effect: runtime.ctx.effect });
 	pending.callback({ uiSession: runtime.ctx.uiSession, effect: runtime.ctx.effect });
 	assert(runtime.listenerCount() === 1, "starts once the service arrives");
 	runtime.setStatus({ "session-a": { running: true } });
