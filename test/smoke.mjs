@@ -270,7 +270,7 @@ console.log("background session finished");
 	assert(runtime.real()[0].title === "重构登录模块", "toast title is the session title");
 	assert(String(runtime.real()[0].body).startsWith("本轮已完成"), "toast body uses the configured message");
 	assert(String(runtime.real()[0].body).includes("对话：重构登录模块"), "toast body names the completed conversation");
-	assert(String(runtime.real()[0].tag).startsWith("dshturn-"), "toast tag is per session");
+	assert(String(runtime.real()[0].tag).startsWith("dshturn-"), "toast uses the notification tag prefix");
 	// a further publish with no change must not repeat
 	runtime.setStatus({ "session-a": { running: false, pendingInteraction: { kind: "question" } } });
 	assert(runtime.real().length === 1, "unrelated status churn does not repeat the toast");
@@ -450,7 +450,11 @@ console.log("notification tags");
 		[prefix + "002"]: { running: false },
 	});
 	assert(runtime.real().length === 2, "simultaneously completed sessions both notify");
-	assert(runtime.real()[0].tag !== runtime.real()[1].tag, "full session ids prevent tag collisions");
+	assert(runtime.real()[0].tag !== runtime.real()[1].tag, "simultaneous completions have distinct tags");
+	assert(runtime.real().every((toast) => toast.tag.length <= 16), "notification tags fit native platform limits");
+	runtime.setStatus({ [prefix + "001"]: { running: true } });
+	runtime.setStatus({ [prefix + "001"]: { running: false } });
+	assert(new Set(runtime.real().map((toast) => toast.tag)).size === 3, "consecutive completions do not replace earlier notifications");
 	runtime.dispose();
 }
 
