@@ -1,6 +1,6 @@
 {
   "name": "@99galaxy/dsh-turn-notify",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Windows 系统通知：DSH 会话本轮结束时提醒你，可选前台免打扰；点击通知拉回窗口。",
   "type": "module",
   "main": "lib/index.js",
